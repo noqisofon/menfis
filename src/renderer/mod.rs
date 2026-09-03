@@ -1,13 +1,18 @@
+mod text;
+
 use std::sync::Arc;
 use winit::window::Window;
 
-/// wgpuの初期化状態一式と、単色クリアだけを行う最小描画パイプライン。
+use text::TextLayer;
+
+/// wgpuの初期化状態一式と、背景クリア+テキスト描画の最小パイプライン。
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
+    text: TextLayer,
 }
 
 impl Renderer {
@@ -65,12 +70,21 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
+        let text = TextLayer::new(
+            &device,
+            &queue,
+            config.format,
+            config.width as f32,
+            config.height as f32,
+        );
+
         Self {
             surface,
             device,
             queue,
             config,
             size,
+            text,
         }
     }
 
@@ -82,9 +96,13 @@ impl Renderer {
         self.config.width = new_size.width;
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
+        self.text.resize(new_size.width as f32, new_size.height as f32);
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
+        self.text
+            .prepare(&self.device, &self.queue, self.config.width, self.config.height);
+
         let output = self.surface.get_current_texture()?;
         let view = output
             .texture
@@ -97,7 +115,7 @@ impl Renderer {
             });
 
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("menfis clear pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -116,10 +134,14 @@ impl Renderer {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+
+            self.text.render(&mut render_pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
+
+        self.text.trim();
 
         Ok(())
     }
