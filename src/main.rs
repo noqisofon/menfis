@@ -10,10 +10,11 @@ use app::App;
 
 fn main() {
     env_logger::init();
+    let start_instant = std::time::Instant::now();
 
     let event_loop = EventLoop::new().expect("イベントループの作成に失敗しました");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::default();
+    let mut app = App::new(start_instant);
     event_loop.run_app(&mut app).expect("イベントループの実行に失敗しました");
 }

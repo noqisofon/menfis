@@ -115,9 +115,14 @@ impl Renderer {
         }
     }
 
-    /// バッファのテキスト内容が変わったときに呼び出す(再シェイピングを伴う)。
+    /// バッファのテキスト内容全体が変わったときに呼び出す(全体を再シェイピングする)。
     pub fn set_text(&mut self, text: &str) {
         self.text.set_text(text);
+    }
+
+    /// 1行だけの変更を反映する。行数が変わらない編集の高速経路。
+    pub fn update_line(&mut self, line_idx: usize, text: &str, has_trailing_break: bool) {
+        self.text.update_line(line_idx, text, has_trailing_break);
     }
 
     /// カーソル位置・選択範囲が変わったときに呼び出す。テキスト内容が不変なら

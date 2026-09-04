@@ -1,8 +1,8 @@
-use glyphon::cosmic_text::Scroll;
+use glyphon::cosmic_text::{LineEnding, Scroll};
 use glyphon::{
-    Attrs, Buffer as GlyphBuffer, Cache, Color as GlyphonColor, Cursor, Family, FontSystem,
-    Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
-    TextRenderer as GlyphonTextRenderer, Viewport,
+    Attrs, AttrsList, Buffer as GlyphBuffer, BufferLine, Cache, Color as GlyphonColor, Cursor,
+    Family, FontSystem, Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas,
+    TextBounds, TextRenderer as GlyphonTextRenderer, Viewport,
 };
 
 /// テキスト描画領域の左上パディング。カーソル位置計算でも同じ値を使う。
@@ -71,6 +71,29 @@ impl TextLayer {
             Attrs::new().family(Family::SansSerif),
             Shaping::Advanced,
         );
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    /// 指定した1行だけを更新する(行数は変わらない編集向けの差分更新)。
+    /// バッファ全体を文字列化して`set_text`し直すより、変更のあった行だけを
+    /// 再構築する方がはるかに軽い。
+    ///
+    /// ropeyは末尾が改行で終わる場合その後ろに空行が1つあるものとして行数を
+    /// 数えるが、cosmic-textの行分割はそのような末尾の空行を作らない。その
+    /// ためropey側の行番号がcosmic-text側の`lines`より大きくなることがあり、
+    /// その場合は空行を継ぎ足してから書き込むことで整合させる。
+    pub fn update_line(&mut self, line_idx: usize, text: &str, has_trailing_break: bool) {
+        while self.buffer.lines.len() <= line_idx {
+            self.buffer.lines.push(BufferLine::new(
+                String::new(),
+                LineEnding::None,
+                AttrsList::new(Attrs::new().family(Family::SansSerif)),
+                Shaping::Advanced,
+            ));
+        }
+        let ending = if has_trailing_break { LineEnding::Lf } else { LineEnding::None };
+        let attrs = Attrs::new().family(Family::SansSerif);
+        self.buffer.lines[line_idx].set_text(text, ending, AttrsList::new(attrs));
         self.buffer.shape_until_scroll(&mut self.font_system, false);
     }
 
@@ -206,5 +229,87 @@ impl TextLayer {
     /// グリフキャッシュのうち直近使われなかったものを解放する。
     pub fn trim(&mut self) {
         self.atlas.trim();
+    }
+}
+
+#[cfg(test)]
+mod gpu_tests {
+    use super::*;
+
+    fn create_headless_device() -> (wgpu::Device, wgpu::Queue, wgpu::TextureFormat) {
+        pollster::block_on(async {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::all()),
+                ..Default::default()
+            });
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .expect("ベンチマーク用のGPUアダプタが見つかりません");
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default(), None)
+                .await
+                .expect("ベンチマーク用のデバイス取得に失敗しました");
+            (device, queue, wgpu::TextureFormat::Bgra8UnormSrgb)
+        })
+    }
+
+    /// 数万行規模のファイルで、1行だけの差分更新がバッファ全体の再構築より
+    /// 大幅に高速であることを計測する。GPUを使うため通常のテスト実行では
+    /// スキップし、`cargo test -- --ignored --nocapture`で手動実行する。
+    #[test]
+    #[ignore = "GPUベンチマーク: cargo test --release -- --ignored --nocapture で実行"]
+    fn large_document_line_update_is_much_faster_than_full_resync() {
+        let (device, queue, format) = create_headless_device();
+
+        let line_count = 50_000;
+        let mut text = String::with_capacity(line_count * 32);
+        for i in 0..line_count {
+            text.push_str(&format!("line {i}: 軽快に動くテキストエディタ\n"));
+        }
+
+        let mut layer = TextLayer::new(&device, &queue, format, 800.0, 600.0, &text);
+
+        let start = std::time::Instant::now();
+        layer.update_line(line_count / 2, "line X: 差分更新のベンチマーク", true);
+        let line_update_elapsed = start.elapsed();
+
+        let start = std::time::Instant::now();
+        layer.set_text(&text);
+        let full_resync_elapsed = start.elapsed();
+
+        println!(
+            "{line_count}行のバッファ: 1行更新={line_update_elapsed:?}, フル再構築={full_resync_elapsed:?} ({:.1}倍高速)",
+            full_resync_elapsed.as_secs_f64() / line_update_elapsed.as_secs_f64().max(1e-9)
+        );
+
+        assert!(
+            line_update_elapsed < full_resync_elapsed,
+            "1行更新はフル再構築より速いはず"
+        );
+    }
+
+    /// 回帰テスト: ropeyは末尾が改行で終わる文字列をその後ろに空行が1つある
+    /// ものとして数えるが、cosmic-textの行分割は末尾に空行を作らない。
+    /// `update_line`がこのズレを吸収し、ropey側の行番号への書き込みが
+    /// 正しく反映されることを確認する(実機なしでは検出できず、Xvfb上で
+    /// 「改行して2行目に入力しても表示されない」という形で発覚した)。
+    #[test]
+    #[ignore = "GPUを使うため通常のテスト実行ではスキップ: cargo test -- --ignored --nocapture で実行"]
+    fn update_line_handles_ropey_cosmic_text_line_count_mismatch() {
+        let (device, queue, format) = create_headless_device();
+
+        // "abc\n"はropeyでは2行(2行目は空)だが、cosmic-textの行分割では1行にしかならない。
+        let mut layer = TextLayer::new(&device, &queue, format, 800.0, 600.0, "abc\n");
+
+        // ropey側の行番号(1)へ書き込む。cosmic-text側にまだ存在しない行なので
+        // 空行を継ぎ足してから書き込む必要がある。
+        layer.update_line(1, "second line", false);
+
+        let pos = layer.cursor_pixel_position(1, "second line".len());
+        assert!(
+            pos.is_some(),
+            "2行目が正しく反映されていればカーソル位置が求まるはず"
+        );
     }
 }

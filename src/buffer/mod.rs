@@ -4,6 +4,16 @@ use ropey::{Rope, RopeSlice};
 
 use history::{EditKind, History};
 
+/// バッファのテキストが実際にどう変わったか。差分再描画のために、変更が
+/// 1行に収まるのか、行数そのものが変わるような広範囲の変更なのかを区別する。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextChange {
+    /// 指定した1行の内容だけが変わった(行数は変化していない)。
+    Line(usize),
+    /// 行の増減を伴うなど、広範囲の変更。全体を再シェイピングする必要がある。
+    Full,
+}
+
 /// Ropeベースのテキストバッファ。カーソルと選択範囲は文字オフセットで管理する。
 ///
 /// 改行は`\n`のみを用いる前提としている(`\r`は挿入しない)。これによりropeyの
@@ -13,8 +23,8 @@ pub struct Buffer {
     cursor: usize,
     selection_anchor: Option<usize>,
     history: History,
-    /// テキスト内容そのものが変わった(再シェイピングが必要)
-    text_dirty: bool,
+    /// テキスト内容の変更(再シェイピングが必要な範囲)。まだ描画側に反映していなければSome。
+    text_change: Option<TextChange>,
     /// カーソル・選択範囲の表示位置が変わった(再シェイピングは不要)
     cursor_dirty: bool,
 }
@@ -28,7 +38,7 @@ impl Buffer {
             cursor,
             selection_anchor: None,
             history: History::new(),
-            text_dirty: true,
+            text_change: Some(TextChange::Full),
             cursor_dirty: true,
         }
     }
@@ -37,9 +47,17 @@ impl Buffer {
         self.rope.to_string()
     }
 
-    /// 前回の呼び出し以降にテキスト内容が変更されていればtrueを返し、フラグを消費する。
-    pub fn take_text_dirty(&mut self) -> bool {
-        std::mem::replace(&mut self.text_dirty, false)
+    /// 指定行のテキスト(行区切り文字を含まない)と、行末に改行があるかどうかを返す。
+    pub fn line_text_and_ending(&self, line_idx: usize) -> (String, bool) {
+        let slice = self.rope.line(line_idx);
+        let content_len = line_char_len_without_break(slice);
+        let has_break = content_len < slice.len_chars();
+        (slice.slice(0..content_len).to_string(), has_break)
+    }
+
+    /// 前回の呼び出し以降のテキスト変更があれば返し、フラグを消費する。
+    pub fn take_text_change(&mut self) -> Option<TextChange> {
+        self.text_change.take()
     }
 
     /// 前回の呼び出し以降にカーソル・選択範囲の表示位置が変わっていればtrueを返し、
@@ -52,8 +70,26 @@ impl Buffer {
         self.cursor_dirty = true;
     }
 
-    fn mark_text_dirty(&mut self) {
-        self.text_dirty = true;
+    /// 編集の前後の(行数, カーソルの行)を比較し、1行に収まる変更か広範囲の変更かを判定して記録する。
+    fn mark_text_changed(&mut self, lines_before: usize, line_before: usize) {
+        let lines_after = self.rope.len_lines();
+        let line_after = self.rope.char_to_line(self.cursor);
+        let change = if lines_after == lines_before && line_before == line_after {
+            TextChange::Line(line_after)
+        } else {
+            TextChange::Full
+        };
+        self.text_change = Some(match self.text_change {
+            Some(TextChange::Full) => TextChange::Full,
+            Some(prev) if prev == change => change,
+            Some(TextChange::Line(_)) => TextChange::Full,
+            None => change,
+        });
+        self.cursor_dirty = true;
+    }
+
+    fn mark_text_changed_full(&mut self) {
+        self.text_change = Some(TextChange::Full);
         self.cursor_dirty = true;
     }
 
@@ -62,11 +98,13 @@ impl Buffer {
     pub fn insert_char(&mut self, c: char) {
         let kind = if c == '\n' { EditKind::Other } else { EditKind::Insert };
         self.history.checkpoint(kind, &self.rope, self.cursor, self.selection_anchor);
+        let lines_before = self.rope.len_lines();
+        let line_before = self.rope.char_to_line(self.cursor);
         self.delete_selection_raw();
         self.rope.insert_char(self.cursor, c);
         self.cursor += 1;
         self.history.note_cursor_after_edit(self.cursor);
-        self.mark_text_dirty();
+        self.mark_text_changed(lines_before, line_before);
     }
 
     /// クリップボードからの貼り付けなど、複数文字をまとめて挿入する。
@@ -75,11 +113,13 @@ impl Buffer {
             return;
         }
         self.history.checkpoint(EditKind::Other, &self.rope, self.cursor, self.selection_anchor);
+        let lines_before = self.rope.len_lines();
+        let line_before = self.rope.char_to_line(self.cursor);
         self.delete_selection_raw();
         self.rope.insert(self.cursor, text);
         self.cursor += text.chars().count();
         self.history.note_cursor_after_edit(self.cursor);
-        self.mark_text_dirty();
+        self.mark_text_changed(lines_before, line_before);
     }
 
     pub fn backspace(&mut self) {
@@ -87,13 +127,15 @@ impl Buffer {
             return;
         }
         self.history.checkpoint(EditKind::Delete, &self.rope, self.cursor, self.selection_anchor);
+        let lines_before = self.rope.len_lines();
+        let line_before = self.rope.char_to_line(self.cursor);
         if self.delete_selection_raw().is_none() {
             let start = self.cursor - 1;
             self.rope.remove(start..self.cursor);
             self.cursor = start;
         }
         self.history.note_cursor_after_edit(self.cursor);
-        self.mark_text_dirty();
+        self.mark_text_changed(lines_before, line_before);
     }
 
     pub fn delete_forward(&mut self) {
@@ -101,11 +143,13 @@ impl Buffer {
             return;
         }
         self.history.checkpoint(EditKind::Delete, &self.rope, self.cursor, self.selection_anchor);
+        let lines_before = self.rope.len_lines();
+        let line_before = self.rope.char_to_line(self.cursor);
         if self.delete_selection_raw().is_none() {
             self.rope.remove(self.cursor..self.cursor + 1);
         }
         self.history.note_cursor_after_edit(self.cursor);
-        self.mark_text_dirty();
+        self.mark_text_changed(lines_before, line_before);
     }
 
     pub fn undo(&mut self) {
@@ -115,7 +159,7 @@ impl Buffer {
             self.rope = rope;
             self.cursor = cursor;
             self.selection_anchor = selection_anchor;
-            self.mark_text_dirty();
+            self.mark_text_changed_full();
         }
     }
 
@@ -126,7 +170,7 @@ impl Buffer {
             self.rope = rope;
             self.cursor = cursor;
             self.selection_anchor = selection_anchor;
-            self.mark_text_dirty();
+            self.mark_text_changed_full();
         }
     }
 
@@ -178,8 +222,10 @@ impl Buffer {
     pub fn cut(&mut self) -> Option<String> {
         self.selection_char_range()?;
         self.history.checkpoint(EditKind::Other, &self.rope, self.cursor, self.selection_anchor);
+        let lines_before = self.rope.len_lines();
+        let line_before = self.rope.char_to_line(self.cursor);
         let text = self.delete_selection_raw();
-        self.mark_text_dirty();
+        self.mark_text_changed(lines_before, line_before);
         text
     }
 
@@ -279,7 +325,7 @@ fn line_char_len_without_break(line: RopeSlice) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::Buffer;
+    use super::{Buffer, TextChange};
 
     #[test]
     fn insert_and_backspace_roundtrip() {
@@ -412,6 +458,46 @@ mod tests {
         assert_eq!(buffer.text(), "ab");
         buffer.undo();
         assert_eq!(buffer.text(), "");
+    }
+
+    #[test]
+    fn single_line_edits_report_line_level_change() {
+        let mut buffer = Buffer::new("abc\ndef\nghi");
+        buffer.take_text_change(); // 初期化時のFullを消費しておく
+
+        buffer.move_left(false); // "ghi"の行内でカーソル移動(テキストは不変)
+        assert_eq!(buffer.take_text_change(), None);
+
+        buffer.insert_char('X'); // 2行目末尾は変えず、3行目のみを変更
+        assert_eq!(buffer.take_text_change(), Some(TextChange::Line(2)));
+
+        buffer.backspace();
+        assert_eq!(buffer.take_text_change(), Some(TextChange::Line(2)));
+    }
+
+    #[test]
+    fn newline_and_merge_report_full_change() {
+        let mut buffer = Buffer::new("abc");
+        buffer.take_text_change();
+
+        buffer.insert_char('\n'); // 行数が増える → Full
+        assert_eq!(buffer.take_text_change(), Some(TextChange::Full));
+
+        buffer.take_text_change();
+        buffer.backspace(); // 改行を削除して行を結合する → Full
+        assert_eq!(buffer.take_text_change(), Some(TextChange::Full));
+    }
+
+    #[test]
+    fn multiple_edits_before_take_widen_to_full_if_lines_differ() {
+        let mut buffer = Buffer::new("abc\ndef");
+        buffer.take_text_change();
+
+        buffer.set_cursor_from_line_byte_col(0, 0, false);
+        buffer.insert_char('X'); // 1行目を変更
+        buffer.set_cursor_from_line_byte_col(1, 0, false);
+        buffer.insert_char('Y'); // takeする前に2行目も変更 → 単一行に収まらずFullになる
+        assert_eq!(buffer.take_text_change(), Some(TextChange::Full));
     }
 
     #[test]

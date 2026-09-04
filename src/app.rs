@@ -9,7 +9,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, ModifiersState};
 use winit::window::{Window, WindowId};
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, TextChange};
 use crate::file_io::{self, IoMessage};
 use crate::input;
 use crate::renderer::Renderer;
@@ -34,14 +34,23 @@ struct AppState {
     encoding: &'static encoding_rs::Encoding,
     io_sender: mpsc::Sender<IoMessage>,
     io_receiver: mpsc::Receiver<IoMessage>,
+    /// IME変換中の未確定文字列。実際のバッファへはまだ反映しない。
+    preedit: Option<String>,
 }
 
 impl AppState {
     /// バッファの変更をレンダラーへ反映する。テキスト自体が変わった場合のみ
     /// 再シェイピングを行い、カーソル移動だけの場合は位置更新のみ行う。
     fn sync_renderer(&mut self) {
-        if self.buffer.take_text_dirty() {
-            self.renderer.set_text(&self.buffer.text());
+        match self.buffer.take_text_change() {
+            Some(TextChange::Line(line_idx)) => {
+                let (text, has_break) = self.buffer.line_text_and_ending(line_idx);
+                self.renderer.update_line(line_idx, &text, has_break);
+            }
+            Some(TextChange::Full) => {
+                self.renderer.set_text(&self.buffer.text());
+            }
+            None => {}
         }
         if self.buffer.take_cursor_dirty() {
             let (line, byte_col) = self.buffer.cursor_byte_col();
@@ -99,6 +108,42 @@ impl AppState {
         }
     }
 
+    /// IME変換中の未確定文字列を、カーソル位置に挿入したかのように表示する。
+    /// 実際のバッファ(Rope)は変更しない。確定(Commit)されて初めて反映される。
+    fn show_preedit(&mut self, text: String) {
+        if text.is_empty() {
+            self.clear_preedit();
+            return;
+        }
+        let (line, byte_col) = self.buffer.cursor_byte_col();
+        let (line_text, has_break) = self.buffer.line_text_and_ending(line);
+        let mut spliced = String::with_capacity(line_text.len() + text.len());
+        spliced.push_str(&line_text[..byte_col]);
+        spliced.push_str(&text);
+        spliced.push_str(&line_text[byte_col..]);
+
+        let preedit_end = byte_col + text.len();
+        self.preedit = Some(text);
+        self.renderer.update_line(line, &spliced, has_break);
+        // 変換中の範囲を選択範囲と同じハイライトで示す(下線ではなく簡易的な代用)。
+        self.renderer
+            .update_cursor(line, preedit_end, Some(((line, byte_col), (line, preedit_end))));
+        self.window.request_redraw();
+    }
+
+    /// 変換の確定・取り消しなどでpreeditが終わったとき、実際のバッファ内容の表示に戻す。
+    fn clear_preedit(&mut self) {
+        if self.preedit.take().is_none() {
+            return;
+        }
+        let (line, byte_col) = self.buffer.cursor_byte_col();
+        let (line_text, has_break) = self.buffer.line_text_and_ending(line);
+        self.renderer.update_line(line, &line_text, has_break);
+        let selection = self.buffer.selection_byte_range();
+        self.renderer.update_cursor(line, byte_col, selection);
+        self.window.request_redraw();
+    }
+
     /// バックグラウンドスレッドからのファイルI/O結果を処理する。
     fn poll_pending_io(&mut self) {
         while let Ok(message) = self.io_receiver.try_recv() {
@@ -123,9 +168,20 @@ impl AppState {
     }
 }
 
-#[derive(Default)]
 pub struct App {
     state: Option<AppState>,
+    start_instant: std::time::Instant,
+    first_frame_logged: bool,
+}
+
+impl App {
+    pub fn new(start_instant: std::time::Instant) -> Self {
+        Self {
+            state: None,
+            start_instant,
+            first_frame_logged: false,
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -169,6 +225,7 @@ impl ApplicationHandler for App {
             encoding: encoding_rs::UTF_8,
             io_sender,
             io_receiver,
+            preedit: None,
         });
     }
 
@@ -244,19 +301,29 @@ impl ApplicationHandler for App {
                 use winit::event::Ime;
                 match ime {
                     Ime::Commit(text) => {
+                        state.clear_preedit();
                         for c in text.chars() {
                             state.buffer.insert_char(c);
                         }
                         state.sync_renderer();
                     }
-                    Ime::Enabled | Ime::Preedit(..) | Ime::Disabled => {
-                        // 変換候補(preedit)の下線表示は未対応。確定入力(Commit)のみ反映する。
+                    Ime::Preedit(text, _cursor_range) => {
+                        state.show_preedit(text);
+                    }
+                    Ime::Enabled => {}
+                    Ime::Disabled => {
+                        state.clear_preedit();
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
                 match state.renderer.render() {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if !self.first_frame_logged {
+                            self.first_frame_logged = true;
+                            log::info!("初回フレーム描画までの時間: {:?}", self.start_instant.elapsed());
+                        }
+                    }
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                         state.renderer.resize(state.window.inner_size());
                     }
