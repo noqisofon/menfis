@@ -1,11 +1,15 @@
+use glyphon::cosmic_text::Scroll;
 use glyphon::{
-    Attrs, Buffer as GlyphBuffer, Cache, Color as GlyphonColor, Family, FontSystem, Metrics,
-    Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
+    Attrs, Buffer as GlyphBuffer, Cache, Color as GlyphonColor, Cursor, Family, FontSystem,
+    Metrics, Resolution, Shaping, SwashCache, TextArea, TextAtlas, TextBounds,
     TextRenderer as GlyphonTextRenderer, Viewport,
 };
 
 /// テキスト描画領域の左上パディング。カーソル位置計算でも同じ値を使う。
 pub const TEXT_ORIGIN: (f32, f32) = (16.0, 16.0);
+
+const FONT_SIZE: f32 = 18.0;
+const LINE_HEIGHT: f32 = 26.0;
 
 /// glyphon(cosmic-text)によるテキスト描画とグリフキャッシュの管理。
 pub struct TextLayer {
@@ -34,7 +38,7 @@ impl TextLayer {
         let renderer =
             GlyphonTextRenderer::new(&mut atlas, device, wgpu::MultisampleState::default(), None);
 
-        let mut buffer = GlyphBuffer::new(&mut font_system, Metrics::new(18.0, 26.0));
+        let mut buffer = GlyphBuffer::new(&mut font_system, Metrics::new(FONT_SIZE, LINE_HEIGHT));
         buffer.set_size(&mut font_system, Some(width), Some(height));
         buffer.set_text(
             &mut font_system,
@@ -103,6 +107,65 @@ impl TextLayer {
             ));
         }
         None
+    }
+
+    /// 選択範囲(開始/終了の(行, 行内バイトオフセット))をハイライト矩形の一覧に変換する。
+    /// 戻り値は`(x, top_y, width, height)`(いずれも画面座標)。
+    pub fn selection_spans(
+        &self,
+        start: (usize, usize),
+        end: (usize, usize),
+    ) -> Vec<(f32, f32, f32, f32)> {
+        let cursor_start = Cursor::new(start.0, start.1);
+        let cursor_end = Cursor::new(end.0, end.1);
+        let mut spans = Vec::new();
+        for run in self.buffer.layout_runs() {
+            if let Some((x, width)) = run.highlight(cursor_start, cursor_end) {
+                spans.push((
+                    TEXT_ORIGIN.0 + x,
+                    TEXT_ORIGIN.1 + run.line_top,
+                    width,
+                    run.line_height,
+                ));
+            }
+        }
+        spans
+    }
+
+    /// 画面座標(テキスト描画領域基準ではなくウィンドウ全体基準)から
+    /// 最も近い(行, 行内バイトオフセット)を求める。マウスクリック/ドラッグに使う。
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        self.buffer
+            .hit(x - TEXT_ORIGIN.0, y - TEXT_ORIGIN.1)
+            .map(|cursor| (cursor.line, cursor.index))
+    }
+
+    /// マウスホイールなどによる相対スクロール。
+    pub fn scroll_by_lines(&mut self, delta: isize) {
+        let current = self.buffer.scroll().line as isize;
+        let max_line = self.buffer.lines.len().saturating_sub(1) as isize;
+        let new_line = (current + delta).clamp(0, max_line) as usize;
+        self.buffer.set_scroll(Scroll::new(new_line, 0.0, 0.0));
+        self.buffer.shape_until_scroll(&mut self.font_system, false);
+    }
+
+    /// 指定した論理行が現在のビューポート内に収まるようスクロール位置を調整する。
+    pub fn ensure_line_visible(&mut self, line: usize, viewport_height: f32) {
+        let visible_lines = ((viewport_height - 2.0 * TEXT_ORIGIN.1) / LINE_HEIGHT)
+            .floor()
+            .max(1.0) as usize;
+        let scroll_line = self.buffer.scroll().line;
+        let new_scroll_line = if line < scroll_line {
+            line
+        } else if line >= scroll_line + visible_lines {
+            line + 1 - visible_lines
+        } else {
+            scroll_line
+        };
+        if new_scroll_line != scroll_line {
+            self.buffer.set_scroll(Scroll::new(new_scroll_line, 0.0, 0.0));
+            self.buffer.shape_until_scroll(&mut self.font_system, false);
+        }
     }
 
     pub fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32) {

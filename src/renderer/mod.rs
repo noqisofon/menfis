@@ -1,13 +1,15 @@
 mod cursor;
+mod selection;
 mod text;
 
 use std::sync::Arc;
 use winit::window::Window;
 
 use cursor::CursorLayer;
+use selection::SelectionLayer;
 use text::TextLayer;
 
-/// wgpuの初期化状態一式と、背景クリア+テキスト+カーソル描画の最小パイプライン。
+/// wgpuの初期化状態一式と、背景クリア+選択範囲+テキスト+カーソル描画の最小パイプライン。
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -16,8 +18,10 @@ pub struct Renderer {
     size: winit::dpi::PhysicalSize<u32>,
     text: TextLayer,
     cursor: CursorLayer,
+    selection: SelectionLayer,
     cursor_line: usize,
     cursor_byte_col: usize,
+    selection_range: Option<((usize, usize), (usize, usize))>,
 }
 
 impl Renderer {
@@ -94,6 +98,8 @@ impl Renderer {
             cursor.set_position(x, top, height);
         }
 
+        let selection = SelectionLayer::new(&device, config.format);
+
         Self {
             surface,
             device,
@@ -102,17 +108,43 @@ impl Renderer {
             size,
             text,
             cursor,
+            selection,
             cursor_line,
             cursor_byte_col,
+            selection_range: None,
         }
     }
 
-    /// バッファの内容とカーソル位置を反映する。編集・カーソル移動のたびに呼び出す。
-    pub fn set_content(&mut self, text: &str, cursor_line: usize, cursor_byte_col: usize) {
+    /// バッファのテキスト内容が変わったときに呼び出す(再シェイピングを伴う)。
+    pub fn set_text(&mut self, text: &str) {
         self.text.set_text(text);
+    }
+
+    /// カーソル位置・選択範囲が変わったときに呼び出す。テキスト内容が不変なら
+    /// 再シェイピングは行わず、カーソル・選択範囲の描画位置だけを更新する。
+    pub fn update_cursor(
+        &mut self,
+        cursor_line: usize,
+        cursor_byte_col: usize,
+        selection_range: Option<((usize, usize), (usize, usize))>,
+    ) {
         self.cursor_line = cursor_line;
         self.cursor_byte_col = cursor_byte_col;
+        self.selection_range = selection_range;
+        self.text
+            .ensure_line_visible(cursor_line, self.config.height as f32);
         self.sync_cursor_position();
+    }
+
+    /// マウスホイールによる相対スクロール(行数)。
+    pub fn scroll_by_lines(&mut self, delta: isize) {
+        self.text.scroll_by_lines(delta);
+        self.sync_cursor_position();
+    }
+
+    /// ウィンドウ座標から(行, 行内バイトオフセット)を求める。マウス操作に使う。
+    pub fn hit_test(&self, x: f32, y: f32) -> Option<(usize, usize)> {
+        self.text.hit_test(x, y)
     }
 
     fn sync_cursor_position(&mut self) {
@@ -141,6 +173,18 @@ impl Renderer {
             .prepare(&self.device, &self.queue, self.config.width, self.config.height);
         self.cursor
             .prepare(&self.queue, self.config.width as f32, self.config.height as f32);
+
+        let selection_spans = match self.selection_range {
+            Some((start, end)) => self.text.selection_spans(start, end),
+            None => Vec::new(),
+        };
+        self.selection.prepare(
+            &self.device,
+            &self.queue,
+            self.config.width as f32,
+            self.config.height as f32,
+            &selection_spans,
+        );
 
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -174,6 +218,7 @@ impl Renderer {
                 timestamp_writes: None,
             });
 
+            self.selection.render(&mut render_pass);
             self.text.render(&mut render_pass);
             self.cursor.render(&mut render_pass);
         }
