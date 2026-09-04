@@ -15,6 +15,8 @@ glyphon = "0.6"
 ropey = "1.6.1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 arboard = "3.6.1"
+rfd = "0.17.2"
+encoding_rs = "0.8.35"
 
 [profile.release]
 opt-level = 3

@@ -1,5 +1,6 @@
 mod app;
 mod buffer;
+mod file_io;
 mod input;
 mod renderer;
 
