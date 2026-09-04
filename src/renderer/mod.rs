@@ -1,11 +1,13 @@
+mod cursor;
 mod text;
 
 use std::sync::Arc;
 use winit::window::Window;
 
+use cursor::CursorLayer;
 use text::TextLayer;
 
-/// wgpuの初期化状態一式と、背景クリア+テキスト描画の最小パイプライン。
+/// wgpuの初期化状態一式と、背景クリア+テキスト+カーソル描画の最小パイプライン。
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -13,10 +15,18 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     size: winit::dpi::PhysicalSize<u32>,
     text: TextLayer,
+    cursor: CursorLayer,
+    cursor_line: usize,
+    cursor_byte_col: usize,
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>) -> Self {
+    pub async fn new(
+        window: Arc<Window>,
+        initial_text: &str,
+        cursor_line: usize,
+        cursor_byte_col: usize,
+    ) -> Self {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -76,7 +86,13 @@ impl Renderer {
             config.format,
             config.width as f32,
             config.height as f32,
+            initial_text,
         );
+
+        let mut cursor = CursorLayer::new(&device, config.format);
+        if let Some((x, top, height)) = text.cursor_pixel_position(cursor_line, cursor_byte_col) {
+            cursor.set_position(x, top, height);
+        }
 
         Self {
             surface,
@@ -85,6 +101,26 @@ impl Renderer {
             config,
             size,
             text,
+            cursor,
+            cursor_line,
+            cursor_byte_col,
+        }
+    }
+
+    /// バッファの内容とカーソル位置を反映する。編集・カーソル移動のたびに呼び出す。
+    pub fn set_content(&mut self, text: &str, cursor_line: usize, cursor_byte_col: usize) {
+        self.text.set_text(text);
+        self.cursor_line = cursor_line;
+        self.cursor_byte_col = cursor_byte_col;
+        self.sync_cursor_position();
+    }
+
+    fn sync_cursor_position(&mut self) {
+        if let Some((x, top, height)) = self
+            .text
+            .cursor_pixel_position(self.cursor_line, self.cursor_byte_col)
+        {
+            self.cursor.set_position(x, top, height);
         }
     }
 
@@ -97,11 +133,14 @@ impl Renderer {
         self.config.height = new_size.height;
         self.surface.configure(&self.device, &self.config);
         self.text.resize(new_size.width as f32, new_size.height as f32);
+        self.sync_cursor_position();
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         self.text
             .prepare(&self.device, &self.queue, self.config.width, self.config.height);
+        self.cursor
+            .prepare(&self.queue, self.config.width as f32, self.config.height as f32);
 
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -136,6 +175,7 @@ impl Renderer {
             });
 
             self.text.render(&mut render_pass);
+            self.cursor.render(&mut render_pass);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));

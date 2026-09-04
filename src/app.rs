@@ -5,13 +5,18 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
+use crate::buffer::Buffer;
+use crate::input;
 use crate::renderer::Renderer;
+
+const INITIAL_TEXT: &str = "Hello, menfis — こんにちは、軽快に動くテキストエディタへようこそ。";
 
 /// ウィンドウとレンダラーがそろって初めて存在する状態。
 /// `resumed`が呼ばれるまでウィンドウは作れないため`Option`で保持する。
 struct AppState {
     window: Arc<Window>,
     renderer: Renderer,
+    buffer: Buffer,
 }
 
 #[derive(Default)]
@@ -32,9 +37,20 @@ impl ApplicationHandler for App {
                 .expect("ウィンドウの作成に失敗しました"),
         );
 
-        let renderer = pollster::block_on(Renderer::new(window.clone()));
+        let buffer = Buffer::new(INITIAL_TEXT);
+        let (cursor_line, cursor_byte_col) = buffer.cursor_byte_col();
+        let renderer = pollster::block_on(Renderer::new(
+            window.clone(),
+            &buffer.text(),
+            cursor_line,
+            cursor_byte_col,
+        ));
 
-        self.state = Some(AppState { window, renderer });
+        self.state = Some(AppState {
+            window,
+            renderer,
+            buffer,
+        });
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
@@ -48,6 +64,16 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(new_size) => state.renderer.resize(new_size),
+            WindowEvent::KeyboardInput { event, .. } => {
+                input::handle_key_event(&mut state.buffer, &event);
+                if state.buffer.take_dirty() {
+                    let (line, byte_col) = state.buffer.cursor_byte_col();
+                    state
+                        .renderer
+                        .set_content(&state.buffer.text(), line, byte_col);
+                    state.window.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => {
                 match state.renderer.render() {
                     Ok(()) => {}
